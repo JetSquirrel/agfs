@@ -85,6 +85,8 @@ func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
 		// Database-related keys
 		"db_path", "dsn", "user", "password", "host", "port", "database",
 		"enable_tls", "tls_server_name", "tls_skip_verify",
+		// SQS-related keys
+		"region", "access_key_id", "secret_access_key", "session_token", "endpoint",
 	}
 	if err := config.ValidateOnlyKnownKeys(cfg, allowedKeys); err != nil {
 		return err
@@ -98,14 +100,16 @@ func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
 		"mysql":   true,
 		"sqlite":  true,
 		"sqlite3": true,
+		"sqs":     true,
+		"aws/sqs": true,
 	}
 	if !validBackends[backendType] {
-		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, sqlite)", backendType)
+		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, sqlite, sqs, aws/sqs)", backendType)
 	}
 
 	// Validate database-related parameters if backend is not memory
 	if backendType != "memory" {
-		for _, key := range []string{"db_path", "dsn", "user", "password", "host", "database", "tls_server_name"} {
+		for _, key := range []string{"db_path", "dsn", "user", "password", "host", "database", "tls_server_name", "region", "access_key_id", "secret_access_key", "session_token", "endpoint"} {
 			if err := config.ValidateStringType(cfg, key); err != nil {
 				return err
 			}
@@ -139,6 +143,8 @@ func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
 		backend = NewMemoryBackend()
 	case "tidb", "mysql", "sqlite", "sqlite3":
 		backend = NewTiDBBackend()
+	case "sqs", "aws/sqs":
+		backend = NewSQSBackend()
 	default:
 		return fmt.Errorf("unsupported backend: %s", backendType)
 	}
@@ -277,6 +283,7 @@ BACKEND COMPARISON:
   - memory: Fastest, no persistence, lost on restart
   - sqlite: Good for single server, persistent, file-based
   - tidb: Best for production, distributed, scalable, persistent
+  - sqs: Managed AWS queue service, durable; nested queue names with '/' are not supported; peek is best-effort and may affect receive counts
 `
 }
 
@@ -287,7 +294,7 @@ func (q *QueueFSPlugin) GetConfigParams() []plugin.ConfigParameter {
 			Type:        "string",
 			Required:    false,
 			Default:     "memory",
-			Description: "Queue backend (memory, tidb, mysql, sqlite, sqlite3)",
+			Description: "Queue backend (memory, tidb, mysql, sqlite, sqlite3, sqs, aws/sqs)",
 		},
 		{
 			Name:        "db_path",
@@ -358,6 +365,41 @@ func (q *QueueFSPlugin) GetConfigParams() []plugin.ConfigParameter {
 			Required:    false,
 			Default:     "false",
 			Description: "Skip TLS certificate verification",
+		},
+		{
+			Name:        "region",
+			Type:        "string",
+			Required:    false,
+			Default:     "",
+			Description: "AWS region (required for SQS backend)",
+		},
+		{
+			Name:        "access_key_id",
+			Type:        "string",
+			Required:    false,
+			Default:     "",
+			Description: "AWS access key ID (optional, otherwise use default credentials chain)",
+		},
+		{
+			Name:        "secret_access_key",
+			Type:        "string",
+			Required:    false,
+			Default:     "",
+			Description: "AWS secret access key (optional, otherwise use default credentials chain)",
+		},
+		{
+			Name:        "session_token",
+			Type:        "string",
+			Required:    false,
+			Default:     "",
+			Description: "AWS session token for temporary credentials",
+		},
+		{
+			Name:        "endpoint",
+			Type:        "string",
+			Required:    false,
+			Default:     "",
+			Description: "Custom SQS endpoint (for LocalStack or compatible services)",
 		},
 	}
 }
@@ -1028,9 +1070,9 @@ type queueFileHandle struct {
 
 // handleManager manages open handles for queueFS
 type handleManager struct {
-	handles  map[int64]*queueFileHandle
-	nextID   int64
-	mu       sync.Mutex
+	handles map[int64]*queueFileHandle
+	nextID  int64
+	mu      sync.Mutex
 }
 
 // Global handle manager for queueFS (per plugin instance would be better, but keeping it simple)
